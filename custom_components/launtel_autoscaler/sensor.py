@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-from homeassistant.components.sensor import (
-    SensorEntity,
-    SensorDeviceClass,
-    SensorStateClass,
-)
+from homeassistant.components.sensor import SensorEntity, SensorStateClass
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import UnitOfDataRate, UnitOfInformation
-from homeassistant.core import HomeAssistant, callback
+from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
@@ -27,23 +22,22 @@ async def async_setup_entry(
     data = hass.data[DOMAIN][entry.entry_id]
     coordinator: LauntelCoordinator = data["coordinator"]
     engine: AutoscaleEngine = data["engine"]
-    service_id: str = data["service_id"]
+    sid: int = data["service_id"]
 
-    entities = [
-        LauntelCurrentTierSensor(coordinator, entry, service_id),
-        LauntelDownloadSpeedSensor(coordinator, entry, service_id),
-        LauntelUploadSpeedSensor(coordinator, entry, service_id),
-        LauntelDailyCostSensor(coordinator, entry, service_id),
-        LauntelServiceStatusSensor(coordinator, entry, service_id),
-        LauntelAutoscalerUtilisationSensor(coordinator, entry, engine, service_id),
-        LauntelLastScaleEventSensor(coordinator, entry, engine, service_id),
-    ]
-    async_add_entities(entities)
+    async_add_entities([
+        LauntelCurrentTierSensor(coordinator, entry, sid),
+        LauntelDownloadSpeedSensor(coordinator, entry, sid),
+        LauntelUploadSpeedSensor(coordinator, entry, sid),
+        LauntelDailyCostSensor(coordinator, entry, sid),
+        LauntelServiceStatusSensor(coordinator, entry, sid),
+        LauntelAutoscalerUtilisationSensor(coordinator, entry, engine, sid),
+        LauntelLastScaleEventSensor(coordinator, entry, engine, sid),
+    ])
 
 
-def _device_info(service_id: str) -> DeviceInfo:
+def _device_info(service_id: int) -> DeviceInfo:
     return DeviceInfo(
-        identifiers={(DOMAIN, service_id)},
+        identifiers={(DOMAIN, str(service_id))},
         name=f"Launtel Service {service_id}",
         manufacturer=MANUFACTURER,
         model="NBN Service",
@@ -51,16 +45,7 @@ def _device_info(service_id: str) -> DeviceInfo:
 
 
 class LauntelBaseSensor(CoordinatorEntity, SensorEntity):
-    """Base sensor tied to the Launtel coordinator."""
-
-    def __init__(
-        self,
-        coordinator: LauntelCoordinator,
-        entry: ConfigEntry,
-        service_id: str,
-        key: str,
-        name: str,
-    ):
+    def __init__(self, coordinator, entry, service_id, key, name):
         super().__init__(coordinator)
         self._attr_unique_id = f"{entry.entry_id}_{key}"
         self._attr_name = name
@@ -68,8 +53,8 @@ class LauntelBaseSensor(CoordinatorEntity, SensorEntity):
 
 
 class LauntelCurrentTierSensor(LauntelBaseSensor):
-    def __init__(self, coordinator, entry, service_id):
-        super().__init__(coordinator, entry, service_id, "current_tier", "Launtel Current Tier")
+    def __init__(self, coordinator, entry, sid):
+        super().__init__(coordinator, entry, sid, "current_tier", "Launtel Current Tier")
         self._attr_icon = "mdi:speedometer"
 
     @property
@@ -79,8 +64,8 @@ class LauntelCurrentTierSensor(LauntelBaseSensor):
 
 
 class LauntelDownloadSpeedSensor(LauntelBaseSensor):
-    def __init__(self, coordinator, entry, service_id):
-        super().__init__(coordinator, entry, service_id, "download_speed", "Launtel Download Speed")
+    def __init__(self, coordinator, entry, sid):
+        super().__init__(coordinator, entry, sid, "download_speed", "Launtel Download Speed")
         self._attr_native_unit_of_measurement = "Mbps"
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:download"
@@ -92,8 +77,8 @@ class LauntelDownloadSpeedSensor(LauntelBaseSensor):
 
 
 class LauntelUploadSpeedSensor(LauntelBaseSensor):
-    def __init__(self, coordinator, entry, service_id):
-        super().__init__(coordinator, entry, service_id, "upload_speed", "Launtel Upload Speed")
+    def __init__(self, coordinator, entry, sid):
+        super().__init__(coordinator, entry, sid, "upload_speed", "Launtel Upload Speed")
         self._attr_native_unit_of_measurement = "Mbps"
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:upload"
@@ -105,8 +90,8 @@ class LauntelUploadSpeedSensor(LauntelBaseSensor):
 
 
 class LauntelDailyCostSensor(LauntelBaseSensor):
-    def __init__(self, coordinator, entry, service_id):
-        super().__init__(coordinator, entry, service_id, "daily_cost", "Launtel Daily Cost")
+    def __init__(self, coordinator, entry, sid):
+        super().__init__(coordinator, entry, sid, "daily_cost", "Launtel Daily Cost")
         self._attr_native_unit_of_measurement = "AUD"
         self._attr_state_class = SensorStateClass.MEASUREMENT
         self._attr_icon = "mdi:currency-usd"
@@ -125,8 +110,8 @@ class LauntelDailyCostSensor(LauntelBaseSensor):
 
 
 class LauntelServiceStatusSensor(LauntelBaseSensor):
-    def __init__(self, coordinator, entry, service_id):
-        super().__init__(coordinator, entry, service_id, "service_status", "Launtel Service Status")
+    def __init__(self, coordinator, entry, sid):
+        super().__init__(coordinator, entry, sid, "service_status", "Launtel Service Status")
         self._attr_icon = "mdi:lan-connect"
 
     @property
@@ -136,10 +121,8 @@ class LauntelServiceStatusSensor(LauntelBaseSensor):
 
 
 class LauntelAutoscalerUtilisationSensor(LauntelBaseSensor):
-    """Shows the current WAN utilisation as seen by the autoscaler."""
-
-    def __init__(self, coordinator, entry, engine: AutoscaleEngine, service_id):
-        super().__init__(coordinator, entry, service_id, "wan_utilisation", "WAN Utilisation (Autoscaler)")
+    def __init__(self, coordinator, entry, engine: AutoscaleEngine, sid):
+        super().__init__(coordinator, entry, sid, "wan_utilisation", "WAN Utilisation (Autoscaler)")
         self._engine = engine
         self._attr_native_unit_of_measurement = "%"
         self._attr_state_class = SensorStateClass.MEASUREMENT
@@ -159,10 +142,8 @@ class LauntelAutoscalerUtilisationSensor(LauntelBaseSensor):
 
 
 class LauntelLastScaleEventSensor(LauntelBaseSensor):
-    """Shows details of the last autoscale event."""
-
-    def __init__(self, coordinator, entry, engine: AutoscaleEngine, service_id):
-        super().__init__(coordinator, entry, service_id, "last_scale_event", "Launtel Last Scale Event")
+    def __init__(self, coordinator, entry, engine: AutoscaleEngine, sid):
+        super().__init__(coordinator, entry, sid, "last_scale_event", "Launtel Last Scale Event")
         self._engine = engine
         self._attr_icon = "mdi:swap-vertical"
 

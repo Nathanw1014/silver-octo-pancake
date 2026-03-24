@@ -12,13 +12,11 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .autoscaler import AutoscaleEngine
-from .const import DOMAIN, MANUFACTURER, TIER_ORDER
+from .const import DOMAIN, MANUFACTURER
 from .coordinator import LauntelCoordinator
-from .launtel_api import LauntelApiClient, LauntelTier
+from .launtel_api import LauntelApiClient
 
 _LOGGER = logging.getLogger(__name__)
-
-TIER_LABELS = {t.tier_id: t.label for t in LauntelTier}
 
 
 async def async_setup_entry(
@@ -30,86 +28,68 @@ async def async_setup_entry(
     coordinator: LauntelCoordinator = data["coordinator"]
     client: LauntelApiClient = data["client"]
     engine: AutoscaleEngine = data["engine"]
-    service_id: str = data["service_id"]
+    sid: int = data["service_id"]
 
     async_add_entities(
-        [LauntelTierSelect(coordinator, client, engine, entry, service_id)]
+        [LauntelTierSelect(coordinator, client, engine, entry, sid)]
     )
 
 
 class LauntelTierSelect(CoordinatorEntity, SelectEntity):
-    """Dropdown to manually select a Launtel speed tier."""
+    """Dropdown to manually select a Launtel speed tier.
 
-    def __init__(
-        self,
-        coordinator: LauntelCoordinator,
-        client: LauntelApiClient,
-        engine: AutoscaleEngine,
-        entry: ConfigEntry,
-        service_id: str,
-    ):
+    Options are populated dynamically from the scraped tier list.
+    """
+
+    def __init__(self, coordinator, client, engine, entry, service_id):
         super().__init__(coordinator)
         self._client = client
         self._engine = engine
-        self._service_id = service_id
         self._attr_unique_id = f"{entry.entry_id}_tier_select"
         self._attr_name = "Launtel Speed Tier"
         self._attr_icon = "mdi:speedometer"
-        self._attr_options = [TIER_LABELS.get(t, t) for t in TIER_ORDER]
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, service_id)},
+            identifiers={(DOMAIN, str(service_id))},
             name=f"Launtel Service {service_id}",
             manufacturer=MANUFACTURER,
             model="NBN Service",
         )
 
     @property
+    def options(self) -> list[str]:
+        """Build options from available tiers (scraped from portal)."""
+        svc = self.coordinator.service
+        if not svc or not svc.available_tiers:
+            return []
+        sorted_tiers = sorted(svc.available_tiers, key=lambda t: t["download"])
+        return [t["name"] for t in sorted_tiers]
+
+    @property
     def current_option(self) -> str | None:
         svc = self.coordinator.service
         if svc:
-            return svc.current_tier
+            return svc.current_tier or None
         return None
 
     async def async_select_option(self, option: str) -> None:
         """Handle user selecting a new speed tier."""
-        # Reverse-lookup tier_id from label
-        tier_id = None
-        for tid, label in TIER_LABELS.items():
-            if label == option or tid == option:
-                tier_id = tid
+        svc = self.coordinator.service
+        if not svc or not svc.available_tiers:
+            _LOGGER.error("No tier data available")
+            return
+
+        # Find the tier matching the selected name
+        selected = None
+        for tier in svc.available_tiers:
+            if tier["name"] == option:
+                selected = tier
                 break
 
-        if tier_id is None:
-            _LOGGER.error("Could not map selection '%s' to a tier_id", option)
+        if selected is None:
+            _LOGGER.error("Could not find tier matching '%s'", option)
             return
 
-        # Get the LauntelTier enum
-        try:
-            tier_enum = next(t for t in LauntelTier if t.tier_id == tier_id)
-        except StopIteration:
-            _LOGGER.error("Unknown tier_id: %s", tier_id)
-            return
-
-        # Fetch available tiers to get the psid
-        tiers = await self._client.get_available_tiers(self._service_id)
-        psid = None
-        for t in tiers:
-            if (
-                t.get("download") == tier_enum.download_mbps
-                and t.get("upload") == tier_enum.upload_mbps
-            ):
-                psid = t["psid"]
-                break
-
-        if psid is None:
-            _LOGGER.error(
-                "Tier %s (%s/%s) not available at this address",
-                tier_id,
-                tier_enum.download_mbps,
-                tier_enum.upload_mbps,
-            )
-            return
-
-        await self._client.change_speed(self._service_id, psid)
-        self._engine.set_current_tier(tier_id)
+        psid = selected["psid"]
+        await self._client.change_speed(svc, psid)
+        self._engine.set_current_psid(psid)
         await self.coordinator.async_request_refresh()
