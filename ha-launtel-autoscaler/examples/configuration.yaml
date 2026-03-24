@@ -1,0 +1,273 @@
+# ═══════════════════════════════════════════════════════════════════════
+#  LAUNTEL AUTOSCALER — HOME ASSISTANT CONFIGURATION EXAMPLES
+# ═══════════════════════════════════════════════════════════════════════
+#
+#  These go in your configuration.yaml (or split files).
+#  They create the WAN utilisation sensor from your UniFi gateway
+#  and set up useful automations around the autoscaler.
+#
+# ═══════════════════════════════════════════════════════════════════════
+
+
+# ── 1. WAN UTILISATION SENSOR ───────────────────────────────────────
+#
+#  The autoscaler needs a sensor that reports WAN utilisation as a
+#  percentage (0–100). There are several ways to get this from UniFi:
+#
+#  OPTION A: Use the UniFi Network integration's built-in sensors.
+#            The HA UniFi integration exposes uplink sensors for the
+#            gateway. Look for entities like:
+#              sensor.udm_wan_download_speed
+#              sensor.udm_wan_upload_speed
+#            Then use a template sensor to calculate utilisation %.
+#
+#  OPTION B: Use SNMP to poll the gateway directly.
+#
+#  OPTION C: Use the UniFi controller API via a REST sensor.
+#
+#  Below is OPTION A (most common) and OPTION C (most flexible).
+
+
+# ── OPTION A: Template sensor from UniFi integration ────────────────
+
+template:
+  - sensor:
+      # Calculates WAN utilisation as a percentage of your current
+      # Launtel tier's download speed.
+      - name: "WAN Utilisation Percent"
+        unique_id: wan_utilisation_percent
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:chart-line
+        state: >
+          {% set wan_down_mbps = states('sensor.udm_wan_download') | float(0) %}
+          {% set tier_down_mbps = states('sensor.launtel_download_speed') | float(100) %}
+          {% if tier_down_mbps > 0 %}
+            {{ ((wan_down_mbps / tier_down_mbps) * 100) | round(1) }}
+          {% else %}
+            0
+          {% endif %}
+        availability: >
+          {{ states('sensor.udm_wan_download') not in ['unknown', 'unavailable'] }}
+        attributes:
+          wan_download_mbps: "{{ states('sensor.udm_wan_download') }}"
+          tier_download_mbps: "{{ states('sensor.launtel_download_speed') }}"
+
+      # Smoothed version (5-minute rolling average) — less noisy
+      - name: "WAN Utilisation Smoothed"
+        unique_id: wan_utilisation_smoothed
+        unit_of_measurement: "%"
+        state_class: measurement
+        icon: mdi:chart-bell-curve
+        state: >
+          {{ state_attr('sensor.wan_utilisation_percent', 'wan_download_mbps')
+             | float(0) | round(1) }}
+
+
+# ── OPTION C: REST sensor polling UniFi controller directly ─────────
+#
+#  Uncomment and configure if you want to bypass the HA UniFi
+#  integration and poll the controller API directly.
+#
+# rest:
+#   - resource: "https://YOUR_UNIFI_CONTROLLER:443/proxy/network/api/s/default/stat/device"
+#     method: POST
+#     headers:
+#       Content-Type: "application/json"
+#       Cookie: !secret unifi_cookie
+#     payload: '{}'
+#     scan_interval: 30
+#     sensor:
+#       - name: "UniFi WAN RX Rate"
+#         unique_id: unifi_wan_rx_rate
+#         value_template: >
+#           {% set gw = value_json.data | selectattr('type', 'eq', 'ugw') | first %}
+#           {{ ((gw.uplink.rx_rate | float(0)) / 1000000) | round(1) }}
+#         unit_of_measurement: "Mbps"
+#
+#       - name: "UniFi WAN TX Rate"
+#         unique_id: unifi_wan_tx_rate
+#         value_template: >
+#           {% set gw = value_json.data | selectattr('type', 'eq', 'ugw') | first %}
+#           {{ ((gw.uplink.tx_rate | float(0)) / 1000000) | round(1) }}
+#         unit_of_measurement: "Mbps"
+
+
+# ── 2. AUTOMATIONS ──────────────────────────────────────────────────
+
+automation:
+
+  # ── Notify on speed tier change ─────────────────────────────────
+  - id: launtel_speed_change_notification
+    alias: "Launtel: Notify on Speed Change"
+    trigger:
+      - platform: event
+        event_type: launtel_autoscaler_speed_changed
+    action:
+      - service: notify.mobile_app_your_phone  # Change to your device
+        data:
+          title: "Launtel Speed Changed"
+          message: >
+            {{ trigger.event.data.direction | title }}: 
+            {{ trigger.event.data.from_tier }} → {{ trigger.event.data.to_tier }}
+            ({{ trigger.event.data.reason }})
+          data:
+            tag: launtel_speed_change
+            group: launtel
+
+  # ── Boost speed for gaming hours ────────────────────────────────
+  - id: launtel_gaming_boost
+    alias: "Launtel: Gaming Hours Boost"
+    trigger:
+      - platform: time
+        at: "19:00:00"
+    condition:
+      - condition: time
+        weekday:
+          - fri
+          - sat
+          - sun
+    action:
+      - service: launtel_autoscaler.change_speed
+        data:
+          tier_id: "1000_50"
+      - service: notify.mobile_app_your_phone
+        data:
+          message: "Launtel boosted to 1000/50 for gaming night!"
+
+  # ── Drop back after gaming hours ────────────────────────────────
+  - id: launtel_gaming_drop
+    alias: "Launtel: Post-Gaming Drop"
+    trigger:
+      - platform: time
+        at: "23:30:00"
+    condition:
+      - condition: time
+        weekday:
+          - fri
+          - sat
+          - sun
+    action:
+      - service: launtel_autoscaler.change_speed
+        data:
+          tier_id: "100_20"
+
+  # ── Disable autoscaler when nobody's home ───────────────────────
+  - id: launtel_away_mode
+    alias: "Launtel: Away Mode"
+    trigger:
+      - platform: state
+        entity_id: group.family
+        to: "not_home"
+        for:
+          minutes: 30
+    action:
+      - service: switch.turn_off
+        target:
+          entity_id: switch.launtel_autoscaler
+      - service: launtel_autoscaler.change_speed
+        data:
+          tier_id: "25_5"
+      - service: notify.mobile_app_your_phone
+        data:
+          message: "Everyone's out — Launtel dropped to 25/5 to save money."
+
+  # ── Re-enable when someone arrives home ─────────────────────────
+  - id: launtel_home_mode
+    alias: "Launtel: Home Mode"
+    trigger:
+      - platform: state
+        entity_id: group.family
+        to: "home"
+    action:
+      - service: launtel_autoscaler.change_speed
+        data:
+          tier_id: "100_20"
+      - service: switch.turn_on
+        target:
+          entity_id: switch.launtel_autoscaler
+
+  # ── Work-from-home schedule: higher upload tier on weekdays ─────
+  - id: launtel_wfh_start
+    alias: "Launtel: WFH Morning Boost"
+    trigger:
+      - platform: time
+        at: "08:00:00"
+    condition:
+      - condition: time
+        weekday:
+          - mon
+          - tue
+          - wed
+          - thu
+          - fri
+      - condition: state
+        entity_id: person.you  # Change to your person entity
+        state: "home"
+    action:
+      - service: launtel_autoscaler.change_speed
+        data:
+          tier_id: "100_40"  # Higher upload for video calls
+
+  # ── Budget guard: alert if daily cost is high ───────────────────
+  - id: launtel_budget_alert
+    alias: "Launtel: Budget Alert"
+    trigger:
+      - platform: numeric_state
+        entity_id: sensor.launtel_daily_cost
+        above: 5.00
+        for:
+          hours: 2
+    action:
+      - service: notify.mobile_app_your_phone
+        data:
+          title: "Launtel Cost Alert"
+          message: >
+            Your Launtel daily rate has been above $5/day for 2 hours.
+            Current: ${{ states('sensor.launtel_daily_cost') }}/day
+            (~${{ (states('sensor.launtel_daily_cost') | float * 30.44) | round(2) }}/month)
+
+
+# ── 3. DASHBOARD CARD (Lovelace) ────────────────────────────────────
+#
+#  Add this to your Lovelace dashboard for a control panel.
+#  Paste into a Manual Card or use the visual editor.
+#
+#  type: vertical-stack
+#  cards:
+#    - type: entities
+#      title: Launtel Internet
+#      icon: mdi:web
+#      entities:
+#        - entity: sensor.launtel_current_tier
+#          name: Current Tier
+#        - entity: sensor.launtel_download_speed
+#          name: Download
+#        - entity: sensor.launtel_upload_speed
+#          name: Upload
+#        - entity: sensor.launtel_daily_cost
+#          name: Daily Cost
+#        - entity: sensor.launtel_service_status
+#          name: Status
+#        - type: divider
+#        - entity: switch.launtel_autoscaler
+#          name: Autoscaler
+#        - entity: sensor.wan_utilisation_percent
+#          name: WAN Utilisation
+#        - entity: sensor.launtel_last_scale_event
+#          name: Last Scale Event
+#        - type: divider
+#        - entity: select.launtel_speed_tier
+#          name: Manual Tier Override
+#
+#    - type: history-graph
+#      title: WAN Utilisation (24h)
+#      hours_to_show: 24
+#      entities:
+#        - entity: sensor.wan_utilisation_percent
+#
+#    - type: history-graph
+#      title: Speed Tier History
+#      hours_to_show: 168
+#      entities:
+#        - entity: sensor.launtel_download_speed
