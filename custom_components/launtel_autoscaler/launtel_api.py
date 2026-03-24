@@ -70,7 +70,7 @@ class LauntelApiClient:
         self._password = password
         self._session = session
         self._owns_session = session is None
-        self._auth_expiry: datetime | None = None
+        self._authenticated = False
         self._lock = asyncio.Lock()
 
     async def _ensure_session(self) -> aiohttp.ClientSession:
@@ -81,6 +81,7 @@ class LauntelApiClient:
                 headers={"Accept-Encoding": "gzip"},
             )
             self._owns_session = True
+            self._authenticated = False
         return self._session
 
     async def close(self):
@@ -93,44 +94,86 @@ class LauntelApiClient:
         """Login to Launtel portal using form POST.
 
         The portal expects form-encoded username/password and returns
-        a 302 redirect on success (session cookie is set automatically).
+        a 302 redirect on success. We follow the redirect to fully
+        establish the session.
         """
         async with self._lock:
             session = await self._ensure_session()
+            self._authenticated = False
+
             try:
+                # Follow the redirect chain to fully establish the session
                 async with session.post(
                     f"{BASE_URL}/login",
                     data={
                         "username": self._username,
                         "password": self._password,
                     },
-                    allow_redirects=False,
+                    allow_redirects=True,
                 ) as resp:
-                    # 302 Found = successful login (redirects to dashboard)
-                    if resp.status == 302:
-                        self._auth_expiry = datetime.now() + timedelta(hours=4)
-                        _LOGGER.debug("Launtel authentication successful")
-                        return True
+                    final_url = str(resp.url)
+                    html = await resp.text()
 
-                    _LOGGER.error(
-                        "Launtel auth failed: status=%s (expected 302)",
-                        resp.status,
+                    # Check if we ended up on the login page (auth failed)
+                    # or on the dashboard/services page (auth succeeded)
+                    if "/login" in final_url or "login" in html[:500].lower():
+                        # Check if the page has a login form - means auth failed
+                        soup = BeautifulSoup(html, "html.parser")
+                        login_form = soup.find("form", action=re.compile(r"login", re.I))
+                        if login_form:
+                            _LOGGER.error("Launtel auth failed: redirected back to login page")
+                            raise LauntelAuthError(
+                                "Authentication failed. Check your Launtel username and password."
+                            )
+
+                    self._authenticated = True
+                    _LOGGER.debug(
+                        "Launtel authentication successful (landed on %s)",
+                        final_url,
                     )
-                    raise LauntelAuthError(
-                        f"Authentication failed (HTTP {resp.status}). "
-                        "Check your Launtel username and password."
-                    )
+                    return True
 
             except aiohttp.ClientError as err:
                 raise LauntelAuthError(f"Connection error: {err}") from err
 
     async def _ensure_auth(self):
-        """Re-authenticate if session has expired."""
-        if (
-            self._auth_expiry is None
-            or datetime.now() >= self._auth_expiry
-        ):
+        """Re-authenticate if not authenticated."""
+        if not self._authenticated:
             await self.authenticate()
+
+    def _is_login_page(self, html: str) -> bool:
+        """Check if the HTML is a login page (means session expired)."""
+        if len(html) < 50:
+            return False
+        # Quick check before parsing
+        lower = html[:2000].lower()
+        if "password" in lower and ("login" in lower or "sign in" in lower):
+            return True
+        return False
+
+    async def _get_page(self, url: str, params: dict | None = None) -> str:
+        """Fetch a page, retrying once with re-auth if session expired."""
+        await self._ensure_auth()
+        session = await self._ensure_session()
+
+        async with session.get(url, params=params, allow_redirects=True) as resp:
+            html = await resp.text()
+
+            # If we got redirected to login, session expired
+            if self._is_login_page(html):
+                _LOGGER.debug("Session expired, re-authenticating...")
+                self._authenticated = False
+                await self.authenticate()
+
+                # Retry the request
+                async with session.get(url, params=params, allow_redirects=True) as retry_resp:
+                    html = await retry_resp.text()
+                    if self._is_login_page(html):
+                        raise LauntelAuthError(
+                            "Still on login page after re-authentication"
+                        )
+
+            return html
 
     # ── Service Queries ─────────────────────────────────────────────
 
@@ -140,76 +183,88 @@ class LauntelApiClient:
         Parses the HTML service cards to extract service IDs,
         names, AVC IDs, and user IDs.
         """
-        await self._ensure_auth()
-        session = await self._ensure_session()
-
         try:
-            async with session.get(f"{BASE_URL}/services") as resp:
-                if resp.status != 200:
-                    raise LauntelApiError(
-                        f"Failed to fetch services page: {resp.status}"
-                    )
-
-                html = await resp.text()
-                soup = BeautifulSoup(html, "html.parser")
-
-                services = []
-                service_cards = soup.find_all("div", class_="service-card")
-
-                for card in service_cards:
-                    # Service name
-                    title_el = card.find("span", class_="service-title-txt")
-                    name = title_el.text.strip() if title_el else "Unknown"
-
-                    # AVC ID (the card's id attribute)
-                    avc_id = card.get("id", "")
-
-                    # User ID (from the stats link href)
-                    user_id = ""
-                    stats_link = card.find("i", class_="fa-bar-chart")
-                    if stats_link and stats_link.parent:
-                        href = stats_link.parent.get("href", "")
-                        parts = href.split("=")
-                        if len(parts) >= 3:
-                            user_id = parts[2]
-
-                    # Service ID (from the pause/unpause button onclick)
-                    service_id = 0
-                    pause_button = card.find(
-                        "button",
-                        onclick=re.compile(r"(un)?pauseService\((\d+)"),
-                    )
-                    if pause_button:
-                        match = re.search(r"\d+", pause_button["onclick"])
-                        if match:
-                            service_id = int(match.group())
-
-                    # Detect pause status
-                    status = "active"
-                    if pause_button:
-                        onclick_text = pause_button.get("onclick", "")
-                        if "unpauseService" in onclick_text:
-                            status = "paused"
-
-                    if service_id:
-                        services.append(
-                            LauntelService(
-                                service_id=service_id,
-                                name=name,
-                                avc_id=avc_id,
-                                user_id=user_id,
-                                status=status,
-                            )
-                        )
-
-                return services
-
+            html = await self._get_page(f"{BASE_URL}/services")
         except aiohttp.ClientError as err:
             raise LauntelApiError(f"Connection error: {err}") from err
+
+        soup = BeautifulSoup(html, "html.parser")
+        services = []
+        service_cards = soup.find_all("div", class_="service-card")
+
+        _LOGGER.debug(
+            "Found %d service cards on /services page", len(service_cards)
+        )
+
+        if not service_cards:
+            # Log a snippet of the page for debugging
+            _LOGGER.warning(
+                "No service-card divs found. Page title: %s, body length: %d",
+                soup.title.string if soup.title else "none",
+                len(html),
+            )
+
+        for card in service_cards:
+            # Service name
+            title_el = card.find("span", class_="service-title-txt")
+            name = title_el.text.strip() if title_el else "Unknown"
+
+            # AVC ID (the card's id attribute)
+            avc_id = card.get("id", "")
+
+            # User ID (from the stats link href)
+            user_id = ""
+            stats_link = card.find("i", class_="fa-bar-chart")
+            if stats_link and stats_link.parent:
+                href = stats_link.parent.get("href", "")
+                parts = href.split("=")
+                if len(parts) >= 3:
+                    user_id = parts[2]
+
+            # Service ID (from the pause/unpause button onclick)
+            service_id = 0
+            pause_button = card.find(
+                "button",
+                onclick=re.compile(r"(un)?pauseService\((\d+)"),
+            )
+            if pause_button:
+                match = re.search(r"\d+", pause_button["onclick"])
+                if match:
+                    service_id = int(match.group())
+
+            # Detect pause status
+            status = "active"
+            if pause_button:
+                onclick_text = pause_button.get("onclick", "")
+                if "unpauseService" in onclick_text:
+                    status = "paused"
+
+            if service_id:
+                _LOGGER.debug(
+                    "Found service: id=%d name=%s avc=%s",
+                    service_id, name, avc_id,
+                )
+                services.append(
+                    LauntelService(
+                        service_id=service_id,
+                        name=name,
+                        avc_id=avc_id,
+                        user_id=user_id,
+                        status=status,
+                    )
+                )
+
+        return services
 
     async def get_service(self, service_id: int) -> LauntelService | None:
         """Fetch a specific service by ID."""
         services = await self.get_services()
+        _LOGGER.debug(
+            "Looking for service %d in %d services: %s",
+            service_id,
+            len(services),
+            [s.service_id for s in services],
+        )
         return next((s for s in services if s.service_id == service_id), None)
 
     async def get_available_tiers(self, service: LauntelService) -> list[dict]:
@@ -218,75 +273,73 @@ class LauntelApiClient:
         Navigates to /service?avcid=<avc_id> and parses the speed
         choices from the HTML list group items.
         """
-        await self._ensure_auth()
-        session = await self._ensure_session()
-
         try:
-            async with session.get(
+            html = await self._get_page(
                 f"{BASE_URL}/service",
                 params={"avcid": service.avc_id},
-            ) as resp:
-                if resp.status != 200:
-                    return []
+            )
+        except (aiohttp.ClientError, LauntelAuthError) as err:
+            _LOGGER.error("Failed to fetch tiers: %s", err)
+            return []
 
-                html = await resp.text()
-                soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html, "html.parser")
+        tiers = []
 
-                tiers = []
+        # Extract loc_id — needed for speed change POST
+        loc_input = soup.find("input", {"name": "locid"})
+        if loc_input:
+            service.loc_id = loc_input.get("value", "")
 
-                # Extract loc_id — needed for speed change POST
-                loc_input = soup.find("input", {"name": "locid"})
-                if loc_input:
-                    service.loc_id = loc_input.get("value", "")
+        # Parse speed choices from the list
+        speed_choices = soup.find_all("span", class_="list-group-item")
+        _LOGGER.debug(
+            "Found %d speed choices for service %s",
+            len(speed_choices), service.service_id,
+        )
 
-                # Parse speed choices from the list
-                speed_choices = soup.find_all("span", class_="list-group-item")
-                for choice in speed_choices:
-                    psid = choice.get("data-value")
-                    if not psid:
-                        continue
+        for choice in speed_choices:
+            psid = choice.get("data-value")
+            if not psid:
+                continue
 
-                    col_values = choice.find_all("div", class_="col-sm-4")
-                    plan_name = (
-                        col_values[0].text.strip() if col_values else "Unknown"
-                    )
-                    price = (
-                        col_values[2].text.strip()
-                        if len(col_values) > 2
-                        else "N/A"
-                    )
+            col_values = choice.find_all("div", class_="col-sm-4")
+            plan_name = (
+                col_values[0].text.strip() if col_values else "Unknown"
+            )
+            price = (
+                col_values[2].text.strip()
+                if len(col_values) > 2
+                else "N/A"
+            )
 
-                    # Parse download/upload from plan name
-                    # e.g. "nbn100/20(100/20)" or "Home Fast(500/50)"
-                    download = 0
-                    upload = 0
-                    speed_match = re.search(r"(\d+)/(\d+)", plan_name)
-                    if speed_match:
-                        download = int(speed_match.group(1))
-                        upload = int(speed_match.group(2))
+            # Parse download/upload from plan name
+            # e.g. "nbn100/20(100/20)" or "Home Fast(500/50)"
+            download = 0
+            upload = 0
+            speed_match = re.search(r"(\d+)/(\d+)", plan_name)
+            if speed_match:
+                download = int(speed_match.group(1))
+                upload = int(speed_match.group(2))
 
-                    # Parse daily cost from price string
-                    daily_cost = 0.0
-                    cost_match = re.search(r"\$(\d+\.?\d*)", price)
-                    if cost_match:
-                        daily_cost = float(cost_match.group(1))
+            # Parse daily cost from price string
+            daily_cost = 0.0
+            cost_match = re.search(r"\$(\d+\.?\d*)", price)
+            if cost_match:
+                daily_cost = float(cost_match.group(1))
 
-                    tiers.append(
-                        {
-                            "psid": int(psid),
-                            "name": plan_name,
-                            "price": price,
-                            "download": download,
-                            "upload": upload,
-                            "daily_cost": daily_cost,
-                        }
-                    )
+            tiers.append(
+                {
+                    "psid": int(psid),
+                    "name": plan_name,
+                    "price": price,
+                    "download": download,
+                    "upload": upload,
+                    "daily_cost": daily_cost,
+                }
+            )
 
-                service.available_tiers = tiers
-                return tiers
-
-        except aiohttp.ClientError as err:
-            raise LauntelApiError(f"Connection error: {err}") from err
+        service.available_tiers = tiers
+        return tiers
 
     # ── Speed Changes ───────────────────────────────────────────────
 
@@ -329,7 +382,7 @@ class LauntelApiClient:
         )
 
         try:
-            async with session.post(url) as resp:
+            async with session.post(url, allow_redirects=True) as resp:
                 if resp.status in (200, 302):
                     _LOGGER.info(
                         "Speed change submitted: service=%s psid=%s",
@@ -358,7 +411,8 @@ class LauntelApiClient:
 
         try:
             async with session.post(
-                f"{BASE_URL}/service_pause/{service.service_id}"
+                f"{BASE_URL}/service_pause/{service.service_id}",
+                allow_redirects=True,
             ) as resp:
                 resp.raise_for_status()
                 _LOGGER.info("Service %s paused", service.service_id)
@@ -374,7 +428,8 @@ class LauntelApiClient:
 
         try:
             async with session.post(
-                f"{BASE_URL}/service_unpause/{service.service_id}"
+                f"{BASE_URL}/service_unpause/{service.service_id}",
+                allow_redirects=True,
             ) as resp:
                 resp.raise_for_status()
                 _LOGGER.info("Service %s unpaused", service.service_id)
